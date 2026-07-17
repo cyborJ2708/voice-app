@@ -1,0 +1,3 @@
+# Build-time only — never shipped inside the packaged .exe, so it doesn't
+# touch runtime attack surface. Keep separate from requirements.txt.
+pyinstaller>=6.10

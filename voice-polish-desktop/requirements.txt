@@ -1,0 +1,9 @@
+# voice-polish-desktop dependencies
+# Kept deliberately minimal — each package is well-known/widely audited.
+# See README.md "Dependency notes" for the rationale on each entry.
+
+PySide6==6.8.2       # Qt bindings: tray icon, overlay window, animations, clipboard
+sounddevice==0.5.1   # PortAudio wrapper: microphone capture (no disk writes)
+numpy==2.2.4         # audio buffer math for waveform levels
+requests>=2.32.4     # HTTPS client for backend calls; >=2.32.4 fixes CVE-2024-47081
+comtypes==1.4.16     # UI Automation COM interop (focus_detect.py) — thin ctypes/COM binding

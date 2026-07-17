@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+
+# Personal local tool config, not project source
+.claude/settings.local.json
+
+# Runtime data / logs (privacy: contains user speech transcripts + IPs)
+feedback.jsonl
+server.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller / Inno Setup build output (voice-polish-desktop/)
+dist/
+build/
+installer_output/
+*.spec.bak
+
+# Audio (never persisted by design, but guard against accidental drops)
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+*.aac
+
+# Stray dev screenshots
+scripts/*.png
