@@ -89,6 +89,13 @@ def require_current_user(authorization: str | None = Header(default=None)) -> di
     return user
 
 
+def optional_current_user(authorization: str | None = Header(default=None)) -> dict | None:
+    """Like require_current_user, but never raises — /api/polish works fine
+    logged out (dictionary personalization is just skipped), unlike /api/me
+    or the dictionary CRUD endpoints, which are meaningless without a user."""
+    return _verify_supabase_token(authorization)
+
+
 client = genai.Client(api_key=API_KEY)
 
 app = FastAPI()
@@ -129,13 +136,15 @@ def health():
 
 
 @app.post("/api/polish", dependencies=[Depends(verify_app_token)])
-async def polish(audio: UploadFile = File(...)):
+async def polish(audio: UploadFile = File(...), user: dict | None = Depends(optional_current_user)):
     audio_bytes = await audio.read()
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio upload.")
 
     mime_type = resolve_mime_type(audio.content_type, audio.filename)
     system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
+    if user is not None:
+        system_prompt = _apply_dictionary_terms(system_prompt, user["id"])
 
     # A single Gemini attempt per request. Retries across 429/503 live in the
     # frontend (see static/index.html) so the UI can show "Retrying..."
@@ -205,6 +214,56 @@ def _supabase_rest_get(path: str, params: dict) -> list | None:
     return resp.json()
 
 
+def _supabase_rest_post(path: str, body: dict) -> dict | None:
+    """POST a single row via PostgREST, returning the inserted row (with its
+    generated id) — same service-role-bypasses-RLS reasoning as
+    _supabase_rest_get, and same caveat: callers must only ever pass an
+    already-verified user_id, never one taken from client input."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            json=body,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code not in (200, 201):
+        return None
+    rows = resp.json()
+    return rows[0] if rows else None
+
+
+def _supabase_rest_delete(path: str, params: dict) -> bool:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        resp = requests.delete(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Prefer": "return=representation",
+            },
+            params=params,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return False
+    if resp.status_code not in (200, 204):
+        return False
+    if resp.status_code == 204:
+        return True
+    return bool(resp.json())
+
+
 @app.get("/api/me")
 def me(user: dict = Depends(require_current_user)):
     if not SUPABASE_SERVICE_ROLE_KEY:
@@ -226,3 +285,75 @@ def me(user: dict = Depends(require_current_user)):
     dictations_today = usage[0]["dictation_count"] if usage else 0
 
     return {"id": user_id, "email": email, "plan": plan, "dictations_today": dictations_today}
+
+
+# --- dictionary (Stage 4) --------------------------------------------------
+#
+# Custom per-user terms merged into the Gemini system prompt at polish time
+# (see _apply_dictionary_terms below and its call in /api/polish), so
+# proper nouns / jargon / names get transcribed the way the user actually
+# spells them rather than the nearest common word. dictionary_terms table:
+# see supabase_dictionary_terms.sql.
+
+MAX_DICTIONARY_TERM_LENGTH = 200
+
+
+class DictionaryTermIn(BaseModel):
+    term: str
+
+
+@app.get("/api/dictionary")
+def list_dictionary(user: dict = Depends(require_current_user)):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Dictionary isn't configured on this server yet.")
+    rows = _supabase_rest_get(
+        "dictionary_terms", {"user_id": f"eq.{user['id']}", "select": "id,term", "order": "term.asc"}
+    )
+    return {"terms": rows or []}
+
+
+@app.post("/api/dictionary")
+def add_dictionary_term(payload: DictionaryTermIn, user: dict = Depends(require_current_user)):
+    term = payload.term.strip()
+    if not term:
+        raise HTTPException(status_code=400, detail="term must not be empty.")
+    if len(term) > MAX_DICTIONARY_TERM_LENGTH:
+        raise HTTPException(status_code=400, detail="term is too long.")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Dictionary isn't configured on this server yet.")
+
+    row = _supabase_rest_post("dictionary_terms", {"user_id": user["id"], "term": term})
+    if row is None:
+        raise HTTPException(status_code=502, detail="Could not save the term.")
+    return row
+
+
+@app.delete("/api/dictionary/{term_id}")
+def delete_dictionary_term(term_id: str, user: dict = Depends(require_current_user)):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Dictionary isn't configured on this server yet.")
+    # Filtering by both id AND the verified user_id (never a caller-supplied
+    # one) means a user can never delete another user's term even by
+    # guessing/enumerating ids.
+    ok = _supabase_rest_delete("dictionary_terms", {"id": f"eq.{term_id}", "user_id": f"eq.{user['id']}"})
+    if not ok:
+        raise HTTPException(status_code=404, detail="Term not found.")
+    return {"status": "ok"}
+
+
+def _apply_dictionary_terms(system_prompt: str, user_id: str) -> str:
+    terms = _supabase_rest_get(
+        "dictionary_terms",
+        {"user_id": f"eq.{user_id}", "select": "term", "order": "term.asc", "limit": "300"},
+    )
+    if not terms:
+        return system_prompt
+    term_list = "\n".join(f"- {t['term']}" for t in terms)
+    return (
+        f"{system_prompt}\n\n"
+        "Custom Dictionary — the user has specifically registered these words, "
+        "names, and terms. When you hear something that sounds like one of "
+        "these, spell and capitalize it exactly as given below, even if it "
+        "sounds like a different common word:\n"
+        f"{term_list}"
+    )
