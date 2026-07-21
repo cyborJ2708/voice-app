@@ -390,7 +390,7 @@ def _apply_dictionary_terms(system_prompt: str, user_id: str) -> str:
 # gets incremented (previously read-only — nothing ever wrote to it).
 
 VALID_OUTCOMES = {"success", "empty", "error"}
-VALID_INJECTION_TIERS = {"clipboard", "typed", "card"}
+VALID_INJECTION_TIERS = {"clipboard", "typed", "card", "no_target"}
 
 
 class DictationEventIn(BaseModel):
