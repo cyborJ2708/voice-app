@@ -393,9 +393,13 @@ VALID_OUTCOMES = {"success", "empty", "error"}
 VALID_INJECTION_TIERS = {"clipboard", "typed", "card", "no_target"}
 
 
+MAX_REASONABLE_WORD_COUNT = 100_000  # sanity cap, not a real product limit
+
+
 class DictationEventIn(BaseModel):
     outcome: str
     injection_tier: str | None = None
+    word_count: int | None = None
 
 
 @app.post("/api/dictation-events")
@@ -404,13 +408,20 @@ def log_dictation_event(payload: DictationEventIn, user: dict = Depends(require_
         raise HTTPException(status_code=400, detail="invalid outcome")
     if payload.injection_tier is not None and payload.injection_tier not in VALID_INJECTION_TIERS:
         raise HTTPException(status_code=400, detail="invalid injection_tier")
+    if payload.word_count is not None and not (0 <= payload.word_count <= MAX_REASONABLE_WORD_COUNT):
+        raise HTTPException(status_code=400, detail="invalid word_count")
     if not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=501, detail="Insights aren't configured on this server yet.")
 
     user_id = user["id"]
     row = _supabase_rest_post(
         "dictation_events",
-        {"user_id": user_id, "outcome": payload.outcome, "injection_tier": payload.injection_tier},
+        {
+            "user_id": user_id,
+            "outcome": payload.outcome,
+            "injection_tier": payload.injection_tier,
+            "word_count": payload.word_count,
+        },
     )
     if row is None:
         raise HTTPException(status_code=502, detail="Could not log the event.")
@@ -446,7 +457,7 @@ def get_history(user: dict = Depends(require_current_user), limit: int = 50):
         "dictation_events",
         {
             "user_id": f"eq.{user['id']}",
-            "select": "id,created_at,outcome,injection_tier",
+            "select": "id,created_at,outcome,injection_tier,word_count",
             "order": "created_at.desc",
             "limit": str(limit),
         },
@@ -465,7 +476,7 @@ def get_insights(user: dict = Depends(require_current_user)):
         "dictation_events",
         {
             "user_id": f"eq.{user_id}",
-            "select": "outcome,injection_tier,created_at",
+            "select": "outcome,injection_tier,created_at,word_count",
             "created_at": f"gte.{since}",
             "limit": "5000",
         },
@@ -483,9 +494,12 @@ def get_insights(user: dict = Depends(require_current_user)):
         day = str(r["created_at"])[:10]
         daily_counts[day] = daily_counts.get(day, 0) + 1
 
+    total_words = sum(r.get("word_count") or 0 for r in successes)
+
     return {
         "total_last_30_days": total,
         "successes_last_30_days": len(successes),
+        "total_words_last_30_days": total_words,
         "tier_breakdown": tier_counts,
         "daily_counts": daily_counts,
     }
