@@ -1,9 +1,10 @@
 import json
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -48,6 +49,44 @@ def verify_app_token(x_app_token: str | None = Header(default=None, alias="X-App
         return
     if not x_app_token or not secrets.compare_digest(x_app_token, APP_AUTH_TOKEN):
         raise HTTPException(status_code=401, detail="Missing or invalid app token.")
+
+
+# Per-user identity (distinct from APP_AUTH_TOKEN above, which just gates
+# "is this a legitimate copy of the app" — this identifies *who*). Verified
+# by calling Supabase's own /auth/v1/user with the caller's token rather
+# than checking the JWT signature locally: this works regardless of
+# whether the Supabase project signs with HS256 or the newer per-project
+# ES256/RS256 keys, at the cost of one extra network round-trip — an
+# acceptable trade given /api/polish already makes a Gemini call.
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def _verify_supabase_token(authorization: str | None) -> dict | None:
+    if not authorization or not authorization.startswith("Bearer ") or not SUPABASE_URL:
+        return None
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        return None
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY or ""},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
+
+def require_current_user(authorization: str | None = Header(default=None)) -> dict:
+    user = _verify_supabase_token(authorization)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid login token.")
+    return user
 
 
 client = genai.Client(api_key=API_KEY)
@@ -140,3 +179,50 @@ def feedback(payload: FeedbackIn):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     return {"status": "ok"}
+
+
+def _supabase_rest_get(path: str, params: dict) -> list | None:
+    """GET against Supabase's PostgREST API using the service-role key
+    (bypasses RLS — safe here because we already independently verified the
+    caller's identity via require_current_user, and every query below
+    filters by that verified user_id, never a caller-supplied one)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+            params=params,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
+
+@app.get("/api/me")
+def me(user: dict = Depends(require_current_user)):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Account lookups aren't configured on this server yet.")
+
+    user_id = user.get("id")
+    email = user.get("email")
+
+    subs = _supabase_rest_get(
+        "subscriptions", {"user_id": f"eq.{user_id}", "select": "plan,status", "limit": "1"}
+    )
+    plan = subs[0]["plan"] if subs else "free"
+
+    today = date.today().isoformat()
+    usage = _supabase_rest_get(
+        "usage_daily",
+        {"user_id": f"eq.{user_id}", "usage_date": f"eq.{today}", "select": "dictation_count", "limit": "1"},
+    )
+    dictations_today = usage[0]["dictation_count"] if usage else 0
+
+    return {"id": user_id, "email": email, "plan": plan, "dictations_today": dictations_today}

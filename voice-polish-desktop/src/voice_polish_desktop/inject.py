@@ -1,13 +1,24 @@
 """Insert polished text at the current keyboard focus.
 
-Primary path: clipboard paste (Ctrl+V) — preserves the target app's normal
-paste handling (undo stack, formatting rules, etc.) and works everywhere
-paste works. The user's prior clipboard contents are snapshotted first and
-restored afterward.
+Tier 1: clipboard paste (Ctrl+V) — preserves the target app's normal paste
+handling (undo stack, formatting rules, etc.) and works everywhere paste
+works. The user's prior clipboard contents are snapshotted first and
+restored afterward (once success is confirmed — see ClipboardStage).
 
-Fallback path: simulated typing via winkeys.type_unicode_text, which types
-literal Unicode characters (KEYEVENTF_UNICODE) rather than resolving through
-any VK/shortcut table — so typed content can never trigger a shortcut.
+Tier 2 (only reached if tier 1 can't be verified, or SendInput itself
+fails): simulated typing via winkeys.type_unicode_text, which types literal
+Unicode characters (KEYEVENTF_UNICODE) rather than resolving through any
+VK/shortcut table — so typed content can never trigger a shortcut. Slower,
+but works in apps that consume/ignore synthetic Ctrl+V without visibly
+failing (confirmed necessary for some apps during development).
+
+Tier 3: app.py falls back to the on-screen card if neither tier can be
+verified — see ClipboardStage.keep_polished_on_clipboard().
+
+app.py's AppController drives the full tiered pipeline (with the pre-paste
+delay and per-tier verification) via stage_clipboard()/ClipboardStage; the
+simpler attempt_paste()/inject() functions below are single-shot
+equivalents kept for callers that don't need the full pipeline.
 
 Text passed here must already be sanitized by the caller (sanitize.py) —
 this module does not sanitize, keeping the one security-relevant transform
@@ -136,6 +147,10 @@ def attempt_paste(text: str) -> PasteAttempt:
     success) or leave `text` on the clipboard as a safety net (no valid
     target, or the paste couldn't be confirmed) via
     PasteAttempt.keep_polished_on_clipboard().
+
+    This is the simple, single-step version (no pre-paste delay, no typed
+    fallback tier) — kept for callers that don't need the full tiered
+    pipeline. See ClipboardStage/stage_clipboard below for that.
     """
     clipboard = _clipboard()
     snapshot = _snapshot_clipboard(clipboard)
@@ -148,3 +163,49 @@ def attempt_paste(text: str) -> PasteAttempt:
         _restore_clipboard(clipboard, snapshot)  # nothing was pasted, restore immediately
         inject_text_typed(text)
         return PasteAttempt(mode="typed", _clipboard=clipboard, _snapshot=None)
+
+
+@dataclass
+class ClipboardStage:
+    """Clipboard has been set to the target text; no keystroke sent yet.
+
+    Split from a single synchronous call (unlike attempt_paste/PasteAttempt)
+    specifically so the caller can insert a real delay — driven by a Qt
+    QTimer, not a blocking sleep — between staging the clipboard and
+    sending Ctrl+V. Some apps (observed: this was never proven to be the
+    root cause for Word/Notion specifically, but is cheap insurance and
+    matches how a human pasting would naturally have a beat between
+    Ctrl+C-ing content into place and pressing Ctrl+V) may not have fully
+    processed a clipboard-content-changed notification the instant it
+    changes.
+    """
+
+    _clipboard: QClipboard
+    _snapshot: QMimeData
+
+    def send_paste_keystroke(self) -> bool:
+        """Send Ctrl+V. Returns False on an OS-level SendInput failure
+        (caller should treat that as "clipboard tier unavailable, skip
+        straight to the typed tier") rather than raising.
+        """
+        try:
+            winkeys.send_ctrl_v()
+            return True
+        except OSError:
+            return False
+
+    def restore_clipboard(self) -> None:
+        _restore_clipboard(self._clipboard, self._snapshot)
+
+    def keep_polished_on_clipboard(self, text: str) -> None:
+        self._clipboard.setText(text)
+
+
+def stage_clipboard(text: str) -> ClipboardStage:
+    """First half of the tiered pipeline: snapshot + set the clipboard,
+    but don't send Ctrl+V yet — see ClipboardStage.send_paste_keystroke().
+    """
+    clipboard = _clipboard()
+    snapshot = _snapshot_clipboard(clipboard)
+    clipboard.setText(text)
+    return ClipboardStage(_clipboard=clipboard, _snapshot=snapshot)

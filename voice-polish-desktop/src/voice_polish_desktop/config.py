@@ -34,7 +34,13 @@ from .hotkey import DEFAULT_HOTKEY, HotkeySpec
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "voice-polish-desktop"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
-DEFAULT_BACKEND_BASE_URL = "http://localhost:8000"
+# Points at the hosted Render deployment by default — a real installed app
+# has no local backend to fall back to. Local development against
+# `http://localhost:8000` (or any other backend_base_url, https:// included)
+# is still fully supported: it's just a config.json value, editable via the
+# welcome screen on first run, or by hand afterward — see backend_client.py's
+# _validate_base_url for the scheme rules that apply either way.
+DEFAULT_BACKEND_BASE_URL = "https://voice-app-twx2.onrender.com"
 
 
 @dataclass

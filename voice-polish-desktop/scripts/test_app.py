@@ -81,6 +81,15 @@ def main() -> int:
     check("hotkey registered on startup", controller._hotkey_mgr.current is not None)
     check("state starts IDLE", controller._state == AppState.IDLE)
 
+    # NOTE: deliberately NOT monkey-patching controller._on_polish_succeeded
+    # here anymore — doing so replaces the bound QObject method with a bare
+    # Python function on the instance, which breaks Qt's ability to resolve
+    # thread affinity for the signal connection made inside
+    # _start_polish_worker (that connection is made against
+    # `self._on_polish_succeeded` at call time, so it would bind to this
+    # wrapper instead of the real method). app.py's own TRACE prints give
+    # the same visibility without this side effect.
+
     def step_press_to_record():
         print("pressing test hotkey (start)...")
         press_test_hotkey()
@@ -103,8 +112,23 @@ def main() -> int:
             QTimer.singleShot(500, step_check_final)
             return
         check("state returned to IDLE after backend round-trip", controller._state == AppState.IDLE)
+        # controller._state flips back to IDLE immediately inside
+        # _on_polish_succeeded, before the async tiered injection pipeline
+        # (pre-paste delay -> verify -> possible typed tier -> verify again)
+        # even starts — so also poll on the field actually receiving text,
+        # not just on state, or this can check too early and false-fail.
+        QTimer.singleShot(300, lambda: step_check_injection_landed())
+
+    def step_check_injection_landed(elapsed_polls=[0]):
+        if not target.text() and elapsed_polls[0] < 10:
+            elapsed_polls[0] += 1
+            QTimer.singleShot(300, step_check_injection_landed)
+            return
         check("polished text landed in the focused field", len(target.text()) > 0)
         print(f"field text: {target.text()!r}")
+        print(f"DEBUG: pill state={controller._pill._state} card_text={controller._pill._card_text!r}")
+        print(f"DEBUG: clipboard={app.clipboard().text()!r}")
+        print(f"DEBUG: target has focus? {target.hasFocus()}")
         step_test_pause()
 
     def step_test_pause():

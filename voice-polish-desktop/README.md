@@ -32,28 +32,63 @@ First run shows a one-time welcome screen explaining the hotkey (default
 practice box — press the hotkey while it's focused to try the real
 pipeline. After that, only the tray icon and the overlay pill appear.
 
-## Injection fallback (no target / unverified paste)
+## Injection: tiered pipeline + fallback
 
 After the backend responds, the app checks whether an editable field
 currently has keyboard focus — via UI Automation (`focus_detect.py`,
 `comtypes`), not just a Win32 HWND/class-name check, since most modern apps
 (browsers, Electron apps) render their fields inside one HWND with no
-separate child window to inspect at that level.
+separate child window to inspect at that level. Detection is pattern-based
+(`ValuePattern`/`TextEditPattern`, plus `DocumentControlType` + `TextPattern`
+specifically for legacy apps like Word — see below), not control-type-based,
+since e.g. a Qt `QLineEdit` doesn't report the "expected" UIA edit type at
+all yet is still correctly caught by pattern support.
 
 - **No editable target detected** → the polished text is placed on the
   clipboard (the *prior* clipboard contents are **not** restored — the
   polished text is what's left there on purpose) and the pill expands into
   an interactive card showing the full text with **Copy** and dismiss (✕)
-  buttons.
-- **Editable target found** → the app pastes as usual, then reads the
-  field's value back via UI Automation to confirm the text actually landed.
-  Confirmed → clipboard is restored to whatever it held before, as normal.
-  Unconfirmed → same card as above (subtitled "Pasted — or copy here"),
-  and the clipboard again keeps the polished text rather than restoring,
-  so you're covered either way.
+  buttons. No injection attempted at all in this case.
+- **Editable target found** → a tiered pipeline, each step scheduled via
+  `QTimer` (never a blocking sleep, so the pill's animation and the
+  hotkey's native event filter stay responsive):
+  1. **Clipboard + Ctrl+V** (tier 1) — clipboard is staged, then (after a
+     configurable pre-paste delay — `PRE_PASTE_DELAY_MS` in `app.py`,
+     150ms by default, longer for apps confirmed to need it —
+     `PROCESS_PRE_PASTE_OVERRIDES_MS`, e.g. Notion at 350ms) the paste
+     keystroke is sent. After `VERIFY_DELAY_MS` (550ms), UI Automation
+     reads the field back to confirm the text landed.
+  2. **Typed fallback** (tier 2) — only reached if tier 1's `SendInput`
+     itself failed outright, or verification came back uncertain. Types
+     the text as literal Unicode characters (`KEYEVENTF_UNICODE` — never
+     resolves through a shortcut table), then verifies again the same way.
+  3. **Fallback card** (tier 3) — only reached if neither tier could be
+     confirmed. Same card as the no-target case (subtitled "Pasted — or
+     copy here"), clipboard keeps the polished text rather than restoring,
+     so you're covered either way. Whichever tier *did* land (if any) is
+     not undone.
+- Confirmed success (tier 1 or 2) → clipboard is restored to whatever it
+  held before, as normal.
 - The card stays open until dismissed or until a new recording starts
   (whichever comes first), and never writes its text anywhere but the
   screen and the clipboard — cleared from memory the moment it closes.
+
+**Word-specific note**: Word's document surface (UIA class `_WwG`) exposes
+neither `ValuePattern` nor `TextEditPattern` — only plain `TextPattern` —
+and even the legacy MSAA accessibility bridge reports it as a generic
+`ROLE_SYSTEM_CLIENT` rather than `ROLE_SYSTEM_TEXT`, so the normal detection
+tiers miss it entirely (confirmed during development — this was a real,
+reproducible false negative, not a hypothetical). Fixed with a narrowly
+targeted third check: `UIA_DocumentControlTypeId` + `TextPattern` together
+are treated as editable. This doesn't misfire on things like terminal
+emulators (which also expose `TextPattern`) because they report a different
+control type entirely.
+
+**Opt-in debug logging**: set `VOICE_POLISH_DEBUG_LOG=1` in the environment
+to log which tier succeeded per app to
+`%APPDATA%\voice-polish-desktop\injection_debug.log` — only the process
+name (e.g. `notion.exe`) and tier (`clipboard`/`typed`/`card`/`no_target`),
+never the injected text. Off by default.
 
 This verification is inherently best-effort: there's no way to prove a
 target "silently accepted but visually ignored" a paste without reading its
@@ -61,7 +96,11 @@ own UI state back, which is exactly what the UI Automation check does — but
 some custom-rendered controls (e.g. certain canvas-based editors) don't
 expose a readable value at all, and will always land in "unconfirmed" as a
 result. That's the safe failure mode by design: you get the card instead of
-losing the text.
+losing the text. Tested end-to-end (real force-focused apps, real paste,
+real verification, not mocked) against Word, Notion, Slack, Edge/Gmail, and
+Notepad — all five landed via tier 1 (clipboard) during development;
+`scripts/test_multi_app_injection.py` reproduces this and prints which tier
+each app used.
 
 **Note for this dev machine specifically:** `Ctrl+Win+Space` is already
 registered by another running app here (confirmed via a real Win32 error

@@ -24,8 +24,16 @@ from urllib.parse import urlsplit
 import requests
 from PySide6.QtCore import QObject, Signal
 
-CONNECT_TIMEOUT_S = 5
-READ_TIMEOUT_S = 30
+from . import auth
+
+CONNECT_TIMEOUT_S = 10
+# Render's free tier spins the container down after ~15min idle and takes
+# roughly 30-60s to cold-start the next request; combined with normal Gemini
+# call latency (a few seconds, more under load — deliberately measured up to
+# ~45s during a concurrent-request stress test), 30s was cutting it close
+# enough to misreport a slow-but-healthy request as a NetworkError. Widened
+# with real headroom rather than guessing a number.
+READ_TIMEOUT_S = 75
 MAX_ATTEMPTS = 3
 RETRY_DELAY_S = 2.0
 RETRYABLE_STATUS = (429, 503)
@@ -77,6 +85,16 @@ class BackendClient:
         headers = {}
         if self._app_auth_token:
             headers["X-App-Token"] = self._app_auth_token
+        # Per-user identity, when logged in — separate from the app-level
+        # X-App-Token above (which just gates "is this a legitimate copy of
+        # the app", not who's using it). auth.get_valid_access_token()
+        # silently refreshes an expiring token; returns None if there's no
+        # session or refresh failed, in which case the request simply goes
+        # out without it (today's backend doesn't require login to work —
+        # per-user plan/quota enforcement is a later addition).
+        access_token = auth.get_valid_access_token()
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
 
         last_detail = ""
         for attempt in range(1, MAX_ATTEMPTS + 1):

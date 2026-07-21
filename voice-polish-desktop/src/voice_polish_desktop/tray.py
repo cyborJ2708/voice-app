@@ -37,6 +37,8 @@ ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.ico"
 class TrayIcon(QSystemTrayIcon):
     pause_toggled = Signal(bool)         # new paused state
     change_hotkey_requested = Signal()
+    login_requested = Signal()
+    logout_requested = Signal()
     quit_requested = Signal()
 
     def __init__(self, paused: bool = False, parent: QObject | None = None) -> None:
@@ -44,7 +46,12 @@ class TrayIcon(QSystemTrayIcon):
         self.setToolTip("voice-polish-desktop")
 
         self._paused = paused
+        self._logged_in_email: str | None = None
         self._menu = QMenu()
+
+        self._account_action = QAction(self._account_label(), self._menu)
+        self._account_action.triggered.connect(self._on_account_clicked)
+
         self._pause_action = QAction(self._pause_label(), self._menu)
         self._pause_action.triggered.connect(self._on_pause_clicked)
 
@@ -54,6 +61,8 @@ class TrayIcon(QSystemTrayIcon):
         quit_action = QAction("Quit", self._menu)
         quit_action.triggered.connect(self.quit_requested.emit)
 
+        self._menu.addAction(self._account_action)
+        self._menu.addSeparator()
         self._menu.addAction(self._pause_action)
         self._menu.addAction(change_hotkey_action)
         self._menu.addSeparator()
@@ -74,6 +83,22 @@ class TrayIcon(QSystemTrayIcon):
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
         self._pause_action.setText(self._pause_label())
+
+    # -- account (login/logout) ------------------------------------------------
+
+    def _account_label(self) -> str:
+        return f"Log out ({self._logged_in_email})" if self._logged_in_email else "Log in…"
+
+    def _on_account_clicked(self) -> None:
+        if self._logged_in_email:
+            self.logout_requested.emit()
+        else:
+            self.login_requested.emit()
+
+    def set_logged_in_email(self, email: str | None) -> None:
+        """None means logged out. Call after login succeeds/logout completes."""
+        self._logged_in_email = email
+        self._account_action.setText(self._account_label())
 
 
 class HotkeyCaptureDialog(QDialog):

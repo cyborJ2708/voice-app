@@ -20,12 +20,23 @@ the safe one (show the fallback card), never data loss.
 """
 from __future__ import annotations
 
+import ctypes
+
 import comtypes
 import comtypes.client
 
 _uia = None
 _mod = None
 _initialized = False
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_kernel32.OpenProcess.restype = ctypes.c_void_p
+_kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)
+]
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
 
 
 def initialize() -> None:
@@ -46,6 +57,34 @@ def _get_focused_element():
     if not _initialized:
         initialize()
     return _uia.GetFocusedElement()
+
+
+def get_focused_process_name() -> str | None:
+    """Best-effort: the executable name (e.g. "notion.exe") owning the
+    currently-focused element. Used only for per-app delay tuning and
+    opt-in debug logging (process name only — never window text/content).
+    Returns None on any failure rather than raising, matching this
+    module's conservative style.
+    """
+    try:
+        element = _get_focused_element()
+        if element is None:
+            return None
+        pid = element.CurrentProcessId
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            buf_len = ctypes.c_uint32(260)
+            buf = ctypes.create_unicode_buffer(260)
+            if not _kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len)):
+                return None
+            path = buf.value
+            return path.rsplit("\\", 1)[-1].lower() if path else None
+        finally:
+            _kernel32.CloseHandle(handle)
+    except (comtypes.COMError, OSError, AttributeError):
+        return None
 
 
 def has_editable_focus() -> bool:
@@ -80,7 +119,27 @@ def verify_text_present(expected: str) -> bool:
 def _is_editable(element) -> bool:
     if _has_value_pattern_writable(element):
         return True
-    return _supports_pattern(element, _mod.UIA_IsTextEditPatternAvailablePropertyId)
+    if _supports_pattern(element, _mod.UIA_IsTextEditPatternAvailablePropertyId):
+        return True
+    # Legacy Win32 apps (confirmed with real Microsoft Word: its document
+    # surface, UIA class '_WwG', exposes neither ValuePattern nor
+    # TextEditPattern — only plain TextPattern, and even the legacy MSAA
+    # role bridge reports it as a generic ROLE_SYSTEM_CLIENT rather than
+    # ROLE_SYSTEM_TEXT, so neither of the checks above nor a role check
+    # catch it). Narrowly widening to "Document control type + TextPattern"
+    # catches Word without also matching things like terminal emulators
+    # (a different control type) that also expose plain TextPattern —
+    # unlike those, a true read-only UIA_DocumentControlTypeId (e.g. a PDF
+    # viewer) just won't actually receive pasted text, which is exactly the
+    # safe failure mode this module is designed around (verify_text_present
+    # then correctly reports "uncertain" and the caller shows the fallback
+    # card instead of silently losing anything).
+    if (
+        element.CurrentControlType == _mod.UIA_DocumentControlTypeId
+        and _supports_pattern(element, _mod.UIA_IsTextPatternAvailablePropertyId)
+    ):
+        return True
+    return False
 
 
 def _has_value_pattern_writable(element) -> bool:

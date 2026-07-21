@@ -119,8 +119,8 @@ def main() -> int:
     def branch_b_run():
         check("(setup) real UIA confirms QLineEdit IS editable", focus_detect.has_editable_focus())
         controller._on_polish_succeeded(TEXT_B)
-        # allow attempt_paste's SendInput + the VERIFY_DELAY_MS readback to complete
-        QTimer.singleShot(900, branch_b_check)
+        # allow PRE_PASTE_DELAY_MS + the clipboard tier's SendInput + VERIFY_DELAY_MS readback
+        QTimer.singleShot(1100, branch_b_check)
 
     def branch_b_check():
         check("branch B: field received TEXT_B via real paste", field.text() == TEXT_B)
@@ -147,7 +147,10 @@ def main() -> int:
     def branch_c_run():
         focus_detect.verify_text_present = lambda expected: False  # force "uncertain"
         controller._on_polish_succeeded(TEXT_C)
-        QTimer.singleShot(900, branch_c_check)
+        # Now a longer chain: PRE_PASTE_DELAY_MS + VERIFY_DELAY_MS (clipboard
+        # tier, forced to fail) + typed tier + VERIFY_DELAY_MS again (also
+        # forced to fail) before the card finally shows.
+        QTimer.singleShot(1700, branch_c_check)
 
     def branch_c_check():
         focus_detect.verify_text_present = _real_verify
