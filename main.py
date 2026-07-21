@@ -1,7 +1,7 @@
 import json
 import os
 import secrets
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -241,6 +241,27 @@ def _supabase_rest_post(path: str, body: dict) -> dict | None:
     return rows[0] if rows else None
 
 
+def _supabase_rest_patch(path: str, params: dict, body: dict) -> bool:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            params=params,
+            json=body,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        return False
+    return resp.status_code in (200, 204)
+
+
 def _supabase_rest_delete(path: str, params: dict) -> bool:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return False
@@ -357,3 +378,114 @@ def _apply_dictionary_terms(system_prompt: str, user_id: str) -> str:
         "sounds like a different common word:\n"
         f"{term_list}"
     )
+
+
+# --- insights / history (Stage 5) -------------------------------------------
+#
+# Metadata only, never transcript/text content — matches the app's "audio
+# and text are never stored" invariant. The desktop app calls
+# /api/dictation-events once per dictation attempt (after its own tiered
+# injection pipeline resolves, since only the client knows which tier
+# landed); this is also the only place usage_daily.dictation_count actually
+# gets incremented (previously read-only — nothing ever wrote to it).
+
+VALID_OUTCOMES = {"success", "empty", "error"}
+VALID_INJECTION_TIERS = {"clipboard", "typed", "card"}
+
+
+class DictationEventIn(BaseModel):
+    outcome: str
+    injection_tier: str | None = None
+
+
+@app.post("/api/dictation-events")
+def log_dictation_event(payload: DictationEventIn, user: dict = Depends(require_current_user)):
+    if payload.outcome not in VALID_OUTCOMES:
+        raise HTTPException(status_code=400, detail="invalid outcome")
+    if payload.injection_tier is not None and payload.injection_tier not in VALID_INJECTION_TIERS:
+        raise HTTPException(status_code=400, detail="invalid injection_tier")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Insights aren't configured on this server yet.")
+
+    user_id = user["id"]
+    row = _supabase_rest_post(
+        "dictation_events",
+        {"user_id": user_id, "outcome": payload.outcome, "injection_tier": payload.injection_tier},
+    )
+    if row is None:
+        raise HTTPException(status_code=502, detail="Could not log the event.")
+
+    if payload.outcome == "success":
+        _increment_usage_daily(user_id)
+
+    return row
+
+
+def _increment_usage_daily(user_id: str) -> None:
+    today = date.today().isoformat()
+    existing = _supabase_rest_get(
+        "usage_daily",
+        {"user_id": f"eq.{user_id}", "usage_date": f"eq.{today}", "select": "dictation_count", "limit": "1"},
+    )
+    if existing:
+        _supabase_rest_patch(
+            "usage_daily",
+            {"user_id": f"eq.{user_id}", "usage_date": f"eq.{today}"},
+            {"dictation_count": existing[0]["dictation_count"] + 1},
+        )
+    else:
+        _supabase_rest_post("usage_daily", {"user_id": user_id, "usage_date": today, "dictation_count": 1})
+
+
+@app.get("/api/history")
+def get_history(user: dict = Depends(require_current_user), limit: int = 50):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Insights aren't configured on this server yet.")
+    limit = max(1, min(limit, 200))
+    rows = _supabase_rest_get(
+        "dictation_events",
+        {
+            "user_id": f"eq.{user['id']}",
+            "select": "id,created_at,outcome,injection_tier",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        },
+    )
+    return {"events": rows or []}
+
+
+@app.get("/api/insights")
+def get_insights(user: dict = Depends(require_current_user)):
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Insights aren't configured on this server yet.")
+
+    user_id = user["id"]
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    rows = _supabase_rest_get(
+        "dictation_events",
+        {
+            "user_id": f"eq.{user_id}",
+            "select": "outcome,injection_tier,created_at",
+            "created_at": f"gte.{since}",
+            "limit": "5000",
+        },
+    ) or []
+
+    total = len(rows)
+    successes = [r for r in rows if r["outcome"] == "success"]
+    tier_counts: dict[str, int] = {}
+    for r in successes:
+        tier = r.get("injection_tier") or "unknown"
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+
+    daily_counts: dict[str, int] = {}
+    for r in rows:
+        day = str(r["created_at"])[:10]
+        daily_counts[day] = daily_counts.get(day, 0) + 1
+
+    return {
+        "total_last_30_days": total,
+        "successes_last_30_days": len(successes),
+        "tier_breakdown": tier_counts,
+        "daily_counts": daily_counts,
+    }
