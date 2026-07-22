@@ -95,6 +95,135 @@ RAZORPAY_PLAN_IDS = {
 }
 RAZORPAY_TOTAL_COUNT = {"monthly": 120, "annual": 10}  # see razorpay.ts's old note: no "forever" option exists
 
+# Transactional email (welcome + "you're now Pro") — sent from here via
+# Resend's HTTP API directly, since neither is a Supabase Auth email type
+# (those only cover confirm-signup/reset-password/magic-link/etc., configured
+# separately in the Supabase dashboard with Resend as custom SMTP).
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "Ritely <hello@ritelyapp.com>")
+
+# Shared secret Supabase's Database Webhook (on auth.users INSERT) sends as
+# a custom header — same verification pattern as APP_AUTH_TOKEN above, just
+# a separate secret since this guards a different caller.
+SUPABASE_WEBHOOK_SECRET = os.environ.get("SUPABASE_WEBHOOK_SECRET")
+
+
+def _send_email(to_email: str, subject: str, html: str) -> None:
+    if not RESEND_API_KEY or not to_email:
+        return
+    try:
+        requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+            json={"from": RESEND_FROM_EMAIL, "to": [to_email], "subject": subject, "html": html},
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        # Best-effort — a failed welcome/receipt email should never break
+        # signup or subscription activation.
+        print(f"[email] failed to send {subject!r} to {to_email!r}", file=sys.stderr)
+
+
+# Same dark-card/indigo-button visual language as the Supabase auth email
+# templates (D:\ritely\supabase\templates\*.html) — kept as a literal copy
+# here since this service has no access to that repo's files at runtime.
+# The `bgcolor` attribute alongside `background-color` is the "bulletproof
+# button" pattern: some renderers strip inline background-color specifically
+# off <a> tags, but leave it on <td>, so the color survives either way.
+_EMAIL_LOGO_URL = "https://ritelyapp.com/logo-email.png"
+
+
+def _email_shell(heading: str, paragraph: str, button_label: str, button_url: str, footnote: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
+<meta name="x-apple-disable-message-reformatting">
+<title>{heading}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#0c0c0e;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#0c0c0e;">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="width:480px; max-width:100%; background-color:#17171b; border:1px solid #2c2c33; border-radius:16px; overflow:hidden;">
+          <tr>
+            <td align="center" style="padding:32px 32px 0 32px;">
+              <img src="{_EMAIL_LOGO_URL}" width="48" height="48" alt="Ritely" style="display:block; border-radius:12px;">
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:20px 32px 0 32px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+              <h1 style="margin:0; font-size:22px; line-height:1.3; font-weight:600; color:#ffffff;">{heading}</h1>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:12px 32px 0 32px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+              <p style="margin:0; font-size:14px; line-height:1.6; color:#b4b0c9;">{paragraph}</p>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:28px 32px 8px 32px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td align="center" bgcolor="#7c6cff" style="background-color:#7c6cff; border-radius:999px;">
+                    <a href="{button_url}" style="display:inline-block; padding:13px 32px; color:#ffffff; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; font-size:14px; font-weight:600; text-decoration:none; border-radius:999px;">
+                      {button_label}
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:20px 32px 32px 32px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+              <p style="margin:0; font-size:12px; line-height:1.6; color:#75758c;">{footnote}</p>
+            </td>
+          </tr>
+        </table>
+        <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="width:480px; max-width:100%;">
+          <tr>
+            <td align="center" style="padding:20px 32px 0 32px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+              <p style="margin:0; font-size:11px; line-height:1.6; color:#4d4d5c;">
+                Ritely &middot; <a href="https://ritelyapp.com" style="color:#4d4d5c;">ritelyapp.com</a>
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+def _welcome_email_html() -> str:
+    return _email_shell(
+        heading="Welcome to Ritely",
+        paragraph=(
+            "Speak any language and get polished, natural English typed anywhere on Windows "
+            "&mdash; one hotkey, system-wide. Your free plan includes 4,000 words a week, no card required."
+        ),
+        button_label="Open your dashboard",
+        button_url="https://ritelyapp.com/dashboard",
+        footnote="Haven&rsquo;t installed the app yet? Grab it from your dashboard&rsquo;s download card.",
+    )
+
+
+def _pro_welcome_email_html() -> str:
+    return _email_shell(
+        heading="You're now on Pro",
+        paragraph=(
+            "Thanks for upgrading &mdash; your weekly word limit is gone. Dictate as much as you "
+            "want, on every device you use Ritely."
+        ),
+        button_label="Open your dashboard",
+        button_url="https://ritelyapp.com/dashboard",
+        footnote="You can manage or cancel your subscription anytime from your dashboard.",
+    )
+
 
 def _verify_supabase_token(authorization: str | None) -> dict | None:
     if not authorization or not authorization.startswith("Bearer ") or not SUPABASE_URL:
@@ -779,6 +908,39 @@ def cancel_razorpay_subscription(user: dict = Depends(require_current_user)):
     return {"status": "ok"}
 
 
+class SupabaseUserWebhookIn(BaseModel):
+    type: str
+    record: dict | None = None
+
+
+@app.post("/api/webhooks/supabase-user-created")
+async def supabase_user_created_webhook(
+    payload: SupabaseUserWebhookIn,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+) -> dict:
+    # Configured as a Supabase Database Webhook on auth.users, INSERT only
+    # (Database → Webhooks in the dashboard) — fires at signup, before email
+    # confirmation, same moment Supabase's own "Confirm signup" email goes
+    # out. Verified via a custom header (set on the webhook's HTTP config in
+    # Supabase) rather than Razorpay-style HMAC, since Supabase's Database
+    # Webhooks don't sign their payloads.
+    if (
+        not SUPABASE_WEBHOOK_SECRET
+        or not x_webhook_secret
+        or not secrets.compare_digest(x_webhook_secret, SUPABASE_WEBHOOK_SECRET)
+    ):
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+    if payload.type != "INSERT" or not payload.record:
+        return {"status": "ignored"}
+
+    email = payload.record.get("email")
+    if email:
+        _send_email(email, "Welcome to Ritely", _welcome_email_html())
+
+    return {"status": "ok"}
+
+
 _RAZORPAY_ACTIVE_EVENTS = {"subscription.activated", "subscription.charged"}
 _RAZORPAY_INACTIVE_EVENTS = {"subscription.cancelled", "subscription.halted"}
 
@@ -869,6 +1031,13 @@ async def razorpay_webhook(request: Request):
         )
         _upsert_user_usage_subscription(user_id, "pro", "active", expires_at, subscription_id)
         print(f"[razorpay webhook] APPLIED: user_id={user_id!r} -> plan=pro, expires_at={expires_at!r}", file=sys.stderr)
+        # Only on first activation, not every recurring "subscription.charged"
+        # renewal — this is a one-time "you're now Pro" announcement, not a
+        # monthly billing receipt.
+        if event == "subscription.activated":
+            email = (entity.get("notes") or {}).get("email")
+            if email:
+                _send_email(email, "You're now Ritely Pro!", _pro_welcome_email_html())
     else:
         status = event.split(".", 1)[1]  # "cancelled" or "halted"
         _upsert_user_usage_subscription(user_id, "free", status, None, subscription_id)
