@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -6,7 +8,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -61,6 +63,13 @@ def verify_app_token(x_app_token: str | None = Header(default=None, alias="X-App
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+# Razorpay webhook signature secret (set when configuring the webhook URL in
+# Razorpay's dashboard — see the setup walkthrough). This backend never
+# calls Razorpay's API itself (subscription creation happens on the website,
+# see D:\ritely\src\lib\razorpay.ts) — it only receives and verifies the
+# resulting webhook.
+RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
 
 
 def _verify_supabase_token(authorization: str | None) -> dict | None:
@@ -632,3 +641,93 @@ def get_insights(user: dict = Depends(require_current_user)):
         "tier_breakdown": tier_counts,
         "daily_counts": daily_counts,
     }
+
+
+# --- Razorpay subscription webhook (Stage 6) ---------------------------------
+#
+# Subscription *creation* happens on the website (D:\ritely\src\lib\razorpay.ts)
+# — this backend is never involved in checkout, per the "desktop app and this
+# backend never touch payment" requirement. This endpoint only receives
+# Razorpay's async confirmation and is the ONLY place that ever flips a
+# user's plan to "pro" — a client-side checkout "success" callback is never
+# trusted for entitlement, only this signature-verified webhook is.
+
+_RAZORPAY_ACTIVE_EVENTS = {"subscription.activated", "subscription.charged"}
+_RAZORPAY_INACTIVE_EVENTS = {"subscription.cancelled", "subscription.halted"}
+
+
+def _verify_razorpay_signature(body: bytes, signature: str) -> bool:
+    if not RAZORPAY_WEBHOOK_SECRET or not signature:
+        return False
+    expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _upsert_user_usage_subscription(
+    user_id: str,
+    plan: str,
+    subscription_status: str,
+    subscription_expires_at: str | None,
+    razorpay_subscription_id: str,
+) -> None:
+    fields = {
+        "plan": plan,
+        "subscription_status": subscription_status,
+        "subscription_expires_at": subscription_expires_at,
+        "razorpay_subscription_id": razorpay_subscription_id,
+    }
+    existing = _supabase_rest_get("user_usage", {"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"})
+    if existing:
+        _supabase_rest_patch("user_usage", {"user_id": f"eq.{user_id}"}, fields)
+        return
+    # Webhook can arrive for a user who's never made a dictation request yet
+    # (no row exists) — create it rather than silently dropping the event.
+    now_utc = datetime.now(timezone.utc)
+    _supabase_rest_post(
+        "user_usage",
+        {
+            "user_id": user_id,
+            "words_used_this_period": 0,
+            "period_start": _period_start_for(now_utc).isoformat(),
+            **fields,
+        },
+    )
+
+
+@app.post("/api/razorpay/webhook")
+async def razorpay_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not _verify_razorpay_signature(body, signature):
+        raise HTTPException(status_code=400, detail="invalid signature")
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+
+    event = payload.get("event")
+    entity = (payload.get("payload") or {}).get("subscription", {}).get("entity", {})
+    # Set at subscription-creation time (see razorpay.ts's `notes`) and
+    # echoed back verbatim on every webhook for that subscription — the only
+    # correlation between a Razorpay object and our own user_id.
+    user_id = (entity.get("notes") or {}).get("user_id")
+    subscription_id = entity.get("id")
+
+    if not user_id or not subscription_id or event not in (_RAZORPAY_ACTIVE_EVENTS | _RAZORPAY_INACTIVE_EVENTS):
+        return {"status": "ignored"}
+
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Subscriptions aren't configured on this server yet.")
+
+    if event in _RAZORPAY_ACTIVE_EVENTS:
+        current_end = entity.get("current_end")
+        expires_at = (
+            datetime.fromtimestamp(current_end, tz=timezone.utc).isoformat() if current_end else None
+        )
+        _upsert_user_usage_subscription(user_id, "pro", "active", expires_at, subscription_id)
+    else:
+        status = event.split(".", 1)[1]  # "cancelled" or "halted"
+        _upsert_user_usage_subscription(user_id, "free", status, None, subscription_id)
+
+    return {"status": "ok"}
