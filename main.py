@@ -143,8 +143,24 @@ async def polish(audio: UploadFile = File(...), user: dict | None = Depends(opti
 
     mime_type = resolve_mime_type(audio.content_type, audio.filename)
     system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
-    if user is not None:
+
+    # Quota is only enforced for verified, logged-in users — there's no
+    # identity to track it against otherwise (matches how dictionary
+    # personalization already skips silently when user is None).
+    usage = None
+    if user is not None and SUPABASE_SERVICE_ROLE_KEY:
         system_prompt = _apply_dictionary_terms(system_prompt, user["id"])
+        usage = _load_current_usage(user["id"])
+        if usage["plan"] == "free" and usage["words_used_this_period"] >= FREE_WEEKLY_WORD_LIMIT:
+            # Rejected before ever calling Gemini — the whole point is to
+            # not pay for a request we're not going to allow.
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "error": "quota_exceeded",
+                    "reset_date": _next_period_start(usage).isoformat(),
+                },
+            )
 
     # A single Gemini attempt per request. Retries across 429/503 live in the
     # frontend (see static/index.html) so the UI can show "Retrying..."
@@ -161,7 +177,24 @@ async def polish(audio: UploadFile = File(...), user: dict | None = Depends(opti
             ),
         )
         text = (response.text or "").strip()
-        return JSONResponse({"text": text})
+
+        result = {"text": text}
+        if usage is not None:
+            # Allowed to run over the cap on this final request rather than
+            # cutting it off mid-dictation — the limit check above is what
+            # actually blocks the *next* one.
+            word_count = len(text.split()) if text else 0
+            new_total = _increment_words_used(user["id"], usage["words_used_this_period"], word_count)
+            usage["words_used_this_period"] = new_total
+            result.update(
+                {
+                    "plan": usage["plan"],
+                    "words_used": new_total,
+                    "words_remaining": _words_remaining(usage),
+                    "reset_date": _next_period_start(usage).isoformat(),
+                }
+            )
+        return JSONResponse(result)
     except errors.APIError as exc:
         status_code = exc.code if exc.code in RETRYABLE_STATUS_CODES else 502
         raise HTTPException(status_code=status_code, detail=exc.message or str(exc))
@@ -285,6 +318,95 @@ def _supabase_rest_delete(path: str, params: dict) -> bool:
     return bool(resp.json())
 
 
+# --- subscription plans + free-tier quota -----------------------------------
+#
+# user_usage table: one row per user, service-role writes only (RLS blocks
+# any client-side insert/update — see supabase_user_usage.sql). The free
+# tier resets weekly, anchored to a fixed Monday 00:00 IST instant for every
+# user regardless of their actual location — simpler and more predictable
+# than a per-user timezone, and matches how the pricing page advertises the
+# limit ("resets every Monday 00:00 IST").
+
+FREE_WEEKLY_WORD_LIMIT = 4000
+IST_OFFSET = timedelta(hours=5, minutes=30)  # fixed offset — India observes no DST
+
+
+def _period_start_for(now_utc: datetime) -> datetime:
+    """The most recent Monday 00:00 IST at or before now_utc, as a UTC instant."""
+    shifted = now_utc + IST_OFFSET
+    monday_midnight_shifted = shifted.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=shifted.weekday()
+    )
+    return monday_midnight_shifted - IST_OFFSET
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _next_period_start(usage_row: dict) -> datetime:
+    return _parse_iso(usage_row["period_start"]) + timedelta(days=7)
+
+
+def _words_remaining(usage_row: dict) -> int | None:
+    if usage_row["plan"] != "free":
+        return None
+    return max(0, FREE_WEEKLY_WORD_LIMIT - usage_row["words_used_this_period"])
+
+
+def _load_current_usage(user_id: str) -> dict:
+    """Gets (creating if absent) the user's usage row, resetting it first if
+    a Monday-IST boundary has passed since period_start. Callers never need
+    to reason about staleness themselves — the returned row is always
+    current as of `now`."""
+    rows = _supabase_rest_get(
+        "user_usage",
+        {
+            "user_id": f"eq.{user_id}",
+            "select": "plan,words_used_this_period,period_start,subscription_status,subscription_expires_at",
+            "limit": "1",
+        },
+    )
+    row = rows[0] if rows else None
+    now_utc = datetime.now(timezone.utc)
+
+    if row is None:
+        created = _supabase_rest_post(
+            "user_usage",
+            {
+                "user_id": user_id,
+                "plan": "free",
+                "words_used_this_period": 0,
+                "period_start": _period_start_for(now_utc).isoformat(),
+            },
+        )
+        return created or {
+            "plan": "free",
+            "words_used_this_period": 0,
+            "period_start": now_utc.isoformat(),
+            "subscription_status": None,
+            "subscription_expires_at": None,
+        }
+
+    current_boundary = _period_start_for(now_utc)
+    if _parse_iso(row["period_start"]) < current_boundary:
+        _supabase_rest_patch(
+            "user_usage",
+            {"user_id": f"eq.{user_id}"},
+            {"words_used_this_period": 0, "period_start": current_boundary.isoformat()},
+        )
+        row["words_used_this_period"] = 0
+        row["period_start"] = current_boundary.isoformat()
+
+    return row
+
+
+def _increment_words_used(user_id: str, current_total: int, additional_words: int) -> int:
+    new_total = current_total + additional_words
+    _supabase_rest_patch("user_usage", {"user_id": f"eq.{user_id}"}, {"words_used_this_period": new_total})
+    return new_total
+
+
 @app.get("/api/me")
 def me(user: dict = Depends(require_current_user)):
     if not SUPABASE_SERVICE_ROLE_KEY:
@@ -293,19 +415,26 @@ def me(user: dict = Depends(require_current_user)):
     user_id = user.get("id")
     email = user.get("email")
 
-    subs = _supabase_rest_get(
-        "subscriptions", {"user_id": f"eq.{user_id}", "select": "plan,status", "limit": "1"}
-    )
-    plan = subs[0]["plan"] if subs else "free"
-
     today = date.today().isoformat()
-    usage = _supabase_rest_get(
+    usage_daily = _supabase_rest_get(
         "usage_daily",
         {"user_id": f"eq.{user_id}", "usage_date": f"eq.{today}", "select": "dictation_count", "limit": "1"},
     )
-    dictations_today = usage[0]["dictation_count"] if usage else 0
+    dictations_today = usage_daily[0]["dictation_count"] if usage_daily else 0
 
-    return {"id": user_id, "email": email, "plan": plan, "dictations_today": dictations_today}
+    quota = _load_current_usage(user_id)
+
+    return {
+        "id": user_id,
+        "email": email,
+        "plan": quota["plan"],
+        "dictations_today": dictations_today,
+        "words_used": quota["words_used_this_period"],
+        "words_remaining": _words_remaining(quota),
+        "reset_date": _next_period_start(quota).isoformat(),
+        "subscription_status": quota.get("subscription_status"),
+        "subscription_expires_at": quota.get("subscription_expires_at"),
+    }
 
 
 # --- dictionary (Stage 4) --------------------------------------------------
