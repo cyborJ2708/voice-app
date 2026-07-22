@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -913,17 +914,32 @@ class SupabaseUserWebhookIn(BaseModel):
     record: dict | None = None
 
 
+_WELCOME_EMAIL_DELAY_SECONDS = 5 * 60  # arrives a few minutes after Supabase's own confirm-signup email, not at the same instant
+
+
+async def _send_welcome_email_delayed(email: str) -> None:
+    # Runs as a FastAPI BackgroundTask after the webhook response is already
+    # sent, so this doesn't hold the request open. asyncio.sleep here is
+    # non-blocking (cooperative), so many of these pending concurrently costs
+    # nothing but memory. Trade-off: purely in-process — a Render restart
+    # during the 5-minute window loses the pending send silently. Fine for
+    # this app's scale; a real job queue would be overkill.
+    await asyncio.sleep(_WELCOME_EMAIL_DELAY_SECONDS)
+    _send_email(email, "Welcome to Ritely", _welcome_email_html())
+
+
 @app.post("/api/webhooks/supabase-user-created")
 async def supabase_user_created_webhook(
     payload: SupabaseUserWebhookIn,
+    background_tasks: BackgroundTasks,
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ) -> dict:
-    # Configured as a Supabase Database Webhook on auth.users, INSERT only
-    # (Database → Webhooks in the dashboard) — fires at signup, before email
-    # confirmation, same moment Supabase's own "Confirm signup" email goes
-    # out. Verified via a custom header (set on the webhook's HTTP config in
-    # Supabase) rather than Razorpay-style HMAC, since Supabase's Database
-    # Webhooks don't sign their payloads.
+    # Configured as a Supabase Database Webhook on public.profiles, INSERT
+    # only (Database → Webhooks in the dashboard) — a row there is created by
+    # a trigger at the same instant auth.users gets the new row, so this
+    # fires right at signup. Verified via a custom header (set on the
+    # webhook's HTTP config in Supabase) rather than Razorpay-style HMAC,
+    # since Supabase's Database Webhooks don't sign their payloads.
     if (
         not SUPABASE_WEBHOOK_SECRET
         or not x_webhook_secret
@@ -936,7 +952,7 @@ async def supabase_user_created_webhook(
 
     email = payload.record.get("email")
     if email:
-        _send_email(email, "Welcome to Ritely", _welcome_email_html())
+        background_tasks.add_task(_send_welcome_email_delayed, email)
 
     return {"status": "ok"}
 
