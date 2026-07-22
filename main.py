@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import secrets
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -782,26 +783,41 @@ def _upsert_user_usage_subscription(
 async def razorpay_webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
+    # TEMPORARY diagnostic logging — visible in Render's Logs tab, never
+    # prints the signature/secret itself, just enough to see which branch a
+    # real delivery took. Remove once the webhook is confirmed working.
+    print(f"[razorpay webhook] received, body_len={len(body)}, has_signature={bool(signature)}", file=sys.stderr)
+
     if not _verify_razorpay_signature(body, signature):
+        print("[razorpay webhook] REJECTED: signature did not verify", file=sys.stderr)
         raise HTTPException(status_code=400, detail="invalid signature")
 
     try:
         payload = json.loads(body)
     except ValueError:
+        print("[razorpay webhook] REJECTED: body was not valid JSON", file=sys.stderr)
         raise HTTPException(status_code=400, detail="invalid JSON")
 
     event = payload.get("event")
     entity = (payload.get("payload") or {}).get("subscription", {}).get("entity", {})
-    # Set at subscription-creation time (see razorpay.ts's `notes`) and
-    # echoed back verbatim on every webhook for that subscription — the only
-    # correlation between a Razorpay object and our own user_id.
+    # Set at subscription-creation time (see the create-subscription endpoint
+    # above's `notes`) and echoed back verbatim on every webhook for that
+    # subscription — the only correlation between a Razorpay object and our
+    # own user_id.
     user_id = (entity.get("notes") or {}).get("user_id")
     subscription_id = entity.get("id")
+    print(
+        f"[razorpay webhook] event={event!r} subscription_id={subscription_id!r} "
+        f"user_id={user_id!r} notes={entity.get('notes')!r}",
+        file=sys.stderr,
+    )
 
     if not user_id or not subscription_id or event not in (_RAZORPAY_ACTIVE_EVENTS | _RAZORPAY_INACTIVE_EVENTS):
+        print("[razorpay webhook] IGNORED: missing user_id/subscription_id or unhandled event type", file=sys.stderr)
         return {"status": "ignored"}
 
     if not SUPABASE_SERVICE_ROLE_KEY:
+        print("[razorpay webhook] REJECTED: SUPABASE_SERVICE_ROLE_KEY not set", file=sys.stderr)
         raise HTTPException(status_code=501, detail="Subscriptions aren't configured on this server yet.")
 
     if event in _RAZORPAY_ACTIVE_EVENTS:
@@ -810,8 +826,10 @@ async def razorpay_webhook(request: Request):
             datetime.fromtimestamp(current_end, tz=timezone.utc).isoformat() if current_end else None
         )
         _upsert_user_usage_subscription(user_id, "pro", "active", expires_at, subscription_id)
+        print(f"[razorpay webhook] APPLIED: user_id={user_id!r} -> plan=pro, expires_at={expires_at!r}", file=sys.stderr)
     else:
         status = event.split(".", 1)[1]  # "cancelled" or "halted"
         _upsert_user_usage_subscription(user_id, "free", status, None, subscription_id)
+        print(f"[razorpay webhook] APPLIED: user_id={user_id!r} -> plan=free, status={status!r}", file=sys.stderr)
 
     return {"status": "ok"}
