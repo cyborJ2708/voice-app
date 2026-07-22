@@ -737,6 +737,48 @@ def create_razorpay_subscription(payload: CreateSubscriptionIn, user: dict = Dep
     return {"subscription_id": subscription_id, "key_id": RAZORPAY_KEY_ID}
 
 
+@app.post("/api/razorpay/cancel-subscription")
+def cancel_razorpay_subscription(user: dict = Depends(require_current_user)):
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=501, detail="Payments aren't configured on this server yet.")
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=501, detail="Subscriptions aren't configured on this server yet.")
+
+    rows = _supabase_rest_get(
+        "user_usage",
+        {"user_id": f"eq.{user['id']}", "select": "razorpay_subscription_id,plan", "limit": "1"},
+    )
+    row = rows[0] if rows else None
+    subscription_id = row.get("razorpay_subscription_id") if row else None
+    if not row or row.get("plan") != "pro" or not subscription_id:
+        raise HTTPException(status_code=400, detail="No active Pro subscription to cancel.")
+
+    try:
+        resp = requests.post(
+            f"https://api.razorpay.com/v1/subscriptions/{subscription_id}/cancel",
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            # Finishes out the period already paid for rather than cutting
+            # access immediately — Pro features only actually go away once
+            # Razorpay's subscription.cancelled webhook fires at the real
+            # cycle end (same "webhook is the only source of truth for
+            # entitlement" rule as everywhere else here; this endpoint only
+            # ever sets a "cancel is pending" status, never plan=free itself).
+            json={"cancel_at_cycle_end": 1},
+            timeout=15,
+        )
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=502, detail="Could not reach Razorpay.")
+
+    if not resp.ok:
+        raise HTTPException(status_code=502, detail="Razorpay couldn't cancel the subscription.")
+
+    _supabase_rest_patch(
+        "user_usage", {"user_id": f"eq.{user['id']}"}, {"subscription_status": "cancel_at_cycle_end"}
+    )
+
+    return {"status": "ok"}
+
+
 _RAZORPAY_ACTIVE_EVENTS = {"subscription.activated", "subscription.charged"}
 _RAZORPAY_INACTIVE_EVENTS = {"subscription.cancelled", "subscription.halted"}
 
