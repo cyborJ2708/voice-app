@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -65,11 +66,33 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 # Razorpay webhook signature secret (set when configuring the webhook URL in
-# Razorpay's dashboard — see the setup walkthrough). This backend never
-# calls Razorpay's API itself (subscription creation happens on the website,
-# see D:\ritely\src\lib\razorpay.ts) — it only receives and verifies the
-# resulting webhook.
+# Razorpay's dashboard — see the setup walkthrough).
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
+
+# Subscription *creation* also lives here, not on the website — the website
+# is deployed on Cloudflare Workers via OpenNext, which turned out to never
+# bind dashboard-set "Variables and Secrets" into anything the app could
+# actually read (confirmed empirically: every RAZORPAY_* var showed up as
+# missing at runtime no matter how it was configured, while this exact same
+# plain os.environ.get() pattern has worked reliably all along on Render).
+# Moving the one piece of Razorpay logic that needs real secrets to this
+# service sidesteps that platform issue entirely, at the cost of the
+# browser calling this backend directly (see CORS setup below) instead of
+# a same-origin Next.js route.
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
+
+# India-only for now, by explicit choice — US/EU plan ids are deferred, so
+# there's no real region-detection step here at all yet (this backend has
+# no Cloudflare in front of it, so no CF-IPCountry-equivalent signal exists
+# either way). Revisit when US/EU launch: likely by having the website's
+# own /api/pricing (which *can* see CF-IPCountry) hand this endpoint a
+# region, or by adding real IP geolocation here.
+RAZORPAY_PLAN_IDS = {
+    ("IN", "monthly"): os.environ.get("RAZORPAY_PLAN_PRO_IN_MONTHLY"),
+    ("IN", "annual"): os.environ.get("RAZORPAY_PLAN_PRO_IN_ANNUAL"),
+}
+RAZORPAY_TOTAL_COUNT = {"monthly": 120, "annual": 10}  # see razorpay.ts's old note: no "forever" option exists
 
 
 def _verify_supabase_token(authorization: str | None) -> dict | None:
@@ -108,6 +131,18 @@ def optional_current_user(authorization: str | None = Header(default=None)) -> d
 client = genai.Client(api_key=API_KEY)
 
 app = FastAPI()
+
+# Only /api/razorpay/create-subscription is ever called directly by browser
+# JS (see D:\ritely\src\app\pricing\PricingClient.tsx) — every other
+# endpoint is called by either the desktop app (Python's `requests`, not
+# subject to CORS) or the website's own server-side code (same-origin from
+# the browser's perspective). Restricted to the real site origin, not "*".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://ritelyapp.com"],
+    allow_methods=["POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 EXTENSION_MIME_MAP = {
     ".mp3": "audio/mp3",
@@ -643,14 +678,63 @@ def get_insights(user: dict = Depends(require_current_user)):
     }
 
 
-# --- Razorpay subscription webhook (Stage 6) ---------------------------------
+# --- Razorpay subscription checkout + webhook (Stage 6) ----------------------
 #
-# Subscription *creation* happens on the website (D:\ritely\src\lib\razorpay.ts)
-# — this backend is never involved in checkout, per the "desktop app and this
-# backend never touch payment" requirement. This endpoint only receives
-# Razorpay's async confirmation and is the ONLY place that ever flips a
-# user's plan to "pro" — a client-side checkout "success" callback is never
-# trusted for entitlement, only this signature-verified webhook is.
+# The desktop app never touches payment at all (it only reads plan/usage via
+# /api/me and links out to the website to upgrade). The website's own
+# checkout UI (pricing page) calls the endpoint below directly from browser
+# JS — this is the ONE place the browser talks to this backend rather than
+# the website's own server, because that's where the Razorpay secrets
+# actually work reliably (see RAZORPAY_KEY_ID's comment above). Plan
+# activation itself only ever happens via the signature-verified webhook
+# further down — a client-side checkout "success" callback is never trusted
+# for entitlement.
+
+
+class CreateSubscriptionIn(BaseModel):
+    interval: str  # "monthly" or "annual"
+
+
+@app.post("/api/razorpay/create-subscription")
+def create_razorpay_subscription(payload: CreateSubscriptionIn, user: dict = Depends(require_current_user)):
+    if payload.interval not in ("monthly", "annual"):
+        raise HTTPException(status_code=400, detail="interval must be 'monthly' or 'annual'.")
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=501, detail="Payments aren't configured on this server yet.")
+
+    # India-only for now (see RAZORPAY_PLAN_IDS's comment above).
+    plan_id = RAZORPAY_PLAN_IDS.get(("IN", payload.interval))
+    if not plan_id:
+        raise HTTPException(status_code=501, detail="Pro isn't available in your region yet.")
+
+    try:
+        resp = requests.post(
+            "https://api.razorpay.com/v1/subscriptions",
+            auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+            json={
+                "plan_id": plan_id,
+                "customer_notify": 1,
+                "total_count": RAZORPAY_TOTAL_COUNT[payload.interval],
+                # Correlates every future webhook event back to our own
+                # user without a separate mapping table — Razorpay echoes
+                # `notes` back verbatim on every subscription.* webhook
+                # payload (see the webhook handler below).
+                "notes": {"user_id": user["id"], "email": user.get("email", "")},
+            },
+            timeout=15,
+        )
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=502, detail="Could not reach Razorpay.")
+
+    if not resp.ok:
+        raise HTTPException(status_code=502, detail="Razorpay rejected the subscription request.")
+
+    subscription_id = resp.json().get("id")
+    if not subscription_id:
+        raise HTTPException(status_code=502, detail="Razorpay response was missing a subscription id.")
+
+    return {"subscription_id": subscription_id, "key_id": RAZORPAY_KEY_ID}
+
 
 _RAZORPAY_ACTIVE_EVENTS = {"subscription.activated", "subscription.charged"}
 _RAZORPAY_INACTIVE_EVENTS = {"subscription.cancelled", "subscription.halted"}
